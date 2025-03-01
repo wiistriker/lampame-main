@@ -550,6 +550,28 @@
     function _nonIterableRest() {
         throw new TypeError("Invalid attempt to destructure non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method.");
     }
+    function extractTorrentHash(magnetLink) {
+        try {
+            // Проверяем, начинается ли ссылка с "magnet:?"
+            if (!magnetLink.startsWith("magnet:?")) {
+                throw new Error("Invalid Magnet link");
+            }
+
+            // Создаём объект URLSearchParams для парсинга параметров
+            const params = new URLSearchParams(magnetLink.substring(8));
+
+            // Ищем параметр xt (Exact Topic)
+            const xt = params.get("xt");
+            if (!xt || !xt.startsWith("urn:btih:")) {
+                throw new Error("No valid torrent hash found");
+            }
+
+            // Возвращаем сам хеш (удаляем префикс "urn:btih:")
+            return xt.replace("urn:btih:", "").toLowerCase();
+        } catch (error) {
+            return null;
+        }
+    }
 
     // Constant
     var url$2 = Lampa.Storage.field("lmetorrentqBittorentUrl");
@@ -756,7 +778,7 @@
                             size: torrent.totalSize,
                             //state: torrent.status,
                             state: transmissionStatus[torrent.status],
-                            completed: torrent.percentComplete // или другой соответствующий атрибут
+                            completed: torrent.percentDone // или другой соответствующий атрибут
                         };
                     });
                     resolve(standardizedResponse);
@@ -848,6 +870,20 @@
         return new Promise(function (resolve, reject) {
             $.ajax(settings).done(function (response) {
                 try {
+                    let remoteTorrent = null;
+
+                    if (response.arguments) {
+                        if (response.arguments['torrent-duplicate']) {
+                            remoteTorrent = { torrentHash: response.arguments['torrent-duplicate'].hashString };
+                        } else if (response.arguments['torrent-added']) {
+                            remoteTorrent = { torrentHash: response.arguments['torrent-added'].hashString };
+                        }
+                    }
+
+                    if (remoteTorrent) {
+                        Lampa.Listener.send('lme-movie-torrent-added', remoteTorrent);
+                    }
+
                     resolve(Lampa.Noty.show(Lampa.Lang.translate('actionSentSuccessfully')));
                 } catch (error) {
                     console.log('LME Torrent manager', 'Send action:', error);
@@ -859,12 +895,47 @@
             });
         });
     }
+
+    function GetTorrentsData$1(ids) {
+        var settings = {
+            url: "".concat(proxy$1).concat(url$1).concat(path),
+            method: "POST",
+            timeout: 0,
+            headers: getHeaders$1(),
+            data: JSON.stringify({
+                "method": "torrent-get",
+                "arguments": {
+                    "ids": ids,
+                    "fields": ["id", "hashString", "magnetLink", "name", "comment", "status", "totalSize", "percentComplete", "percentDone", "rateDownload"]
+                }
+            })
+        };
+        return new Promise(function (resolve, reject) {
+            $.ajax(settings).done(function (response) {
+                try {
+                    var torrents = {};
+                    response.arguments.torrents.forEach(function (torrent) {
+                        torrents[torrent.hashString] = torrent;
+                    });
+                    resolve(torrents);
+                } catch (error) {
+                    console.log('LME Torrent manager', 'Send action:', error);
+                    reject(Lampa.Noty.show(Lampa.Lang.translate('actionReturnedError')));
+                }
+            }).fail(function (jqXHR, textStatus, errorThrown) {
+                console.log('LME Torrent manager', 'Send file:', textStatus, errorThrown, jqXHR);
+                reject(Lampa.Noty.show(Lampa.Lang.translate('actionReturnedError')));
+            });
+        });
+    }
+
     var Transmission = {
         auth: auth$1,
         GetData: GetData$1,
         GetInfo: GetInfo,
         SendCommand: SendCommand$1,
-        SendTask: SendTask$1
+        SendTask: SendTask$1,
+        GetTorrentsData: GetTorrentsData$1
     };
 
     // Constant
@@ -1930,6 +2001,303 @@
         if (Lampa.Storage.get(manifest.component + 'Select') !== 'universalClient') $(".menu .menu__list").eq(0).append(button);
         $('body').append(Lampa.Template.get('lmemStyle', {}, true));
         Main$1(manifest);
+
+        let torrentsMap = Lampa.Storage.get('lmetorrentTorrMap', {});
+
+        let currentMovie = null;
+        let currentMovieTorrentMap = null;
+        let remoteTorrentsData = null;
+
+        const currentMovieRemoteTorrentsListWasChanged = function () {
+            if (!currentMovie) {
+                return;
+            }
+
+            currentMovieTorrentMap = torrentsMap[currentMovie.id];
+
+            const $torrentContainers = $('#lme-torrents-container');
+            $torrentContainers.html('').hide();
+
+            if (currentMovieTorrentMap) {
+                currentMovieTorrentMap.hashes.forEach(torrentHash => {
+                    var $torrentItem = $('<div>', {
+                        id: 'torrent-item-' + torrentHash,
+                        class: 'torrent-item'
+                    });
+
+                    var $torrentItemTitle = $('<div>', {
+                        class: 'torrent-item__title'
+                    });
+
+                    var $torrentItemDetails = $('<div>', {
+                        class: 'torrent-item__details'
+                    });
+
+                    var $torrentItemProgress = $('<progress>', { max: 100 }).css('width', '100%');
+
+                    $torrentItemDetails.append($torrentItemProgress);
+
+                    $torrentItem.append($torrentItemTitle);
+                    $torrentItem.append($torrentItemDetails);
+
+                    $torrentContainers.append($torrentItem);
+                });
+
+                $torrentContainers.append($('<p>'));
+                $torrentContainers.show();
+
+                startPollingRemoteTorrentsData();
+            } else {
+                stopPollingRemoteTorrentsData();
+            }
+        };
+
+        let isPollingRemoteTorrentsData = false;
+        let fetchRemoteTorrentsDataTimeout = null;
+        const startPollingRemoteTorrentsData = () => {
+            if (remoteTorrentsData) {
+                Lampa.Listener.send('lme-torrents-data', remoteTorrentsData);
+            }
+
+            function fetchRemoteTorrentsData() {
+                if (!currentMovie || !currentMovieTorrentMap) {
+                    return;
+                }
+
+                Transmission.GetTorrentsData(currentMovieTorrentMap.hashes)
+                    .then((data) => {
+                        remoteTorrentsData = data;
+                        Lampa.Listener.send('lme-torrents-data', remoteTorrentsData);
+
+                        fetchRemoteTorrentsDataTimeout = setTimeout(fetchRemoteTorrentsData, 3000);
+                    })
+                ;
+            }
+
+            isPollingRemoteTorrentsData = true;
+            console.log('startPollingRemoteTorrentsData');
+            fetchRemoteTorrentsData();
+        };
+
+        const stopPollingRemoteTorrentsData = function () {
+            if (isPollingRemoteTorrentsData) {
+                isPollingRemoteTorrentsData = false;
+                console.log('stopPollingRemoteTorrentsData');
+            }
+
+            if (fetchRemoteTorrentsDataTimeout) {
+                clearTimeout(fetchRemoteTorrentsDataTimeout);
+            }
+        };
+
+        Lampa.Listener.follow('activity', e => {
+            switch (e.component) {
+                case 'main':
+                    stopPollingRemoteTorrentsData();
+                    break;
+
+                case 'full':
+                    switch (e.type) {
+                        case 'start':
+                            let $container = $('#lme-torrents-container');
+
+                            if ($container.length === 0) {
+                                $container = $('<div>', {
+                                    id: 'lme-torrents-container'
+                                });
+
+                                $container.insertAfter('.full-start-new__details').hide();
+                            }
+
+                            currentMovie = e.object.card;
+                            break;
+                    }
+                    break;
+            }
+        });
+
+        Lampa.Listener.follow('full', function (cardData) {
+            if (cardData.type === 'complite') {
+                let $container = $('#lme-torrents-container');
+
+                if ($container.length === 0) {
+                    $container = $('<div>', {
+                        id: 'lme-torrents-container'
+                    });
+
+                    $container.insertAfter('.full-start-new__details').hide();
+                }
+
+                currentMovieRemoteTorrentsListWasChanged();
+            }
+        });
+
+        Lampa.Listener.follow('torrent', e => {
+            if (e.type === 'render') {
+                let magnetURI = e.element.MagnetUri;
+                if (!magnetURI) {
+                    return;
+                }
+
+                let torrentHash = extractTorrentHash(magnetURI);
+                if (!torrentHash) {
+                    return;
+                }
+
+                let $remoteTorrentDataContainer = $('<div>', {
+                    id: 'torrent-hash-' + torrentHash
+                }).hide();
+
+                let $torrentItemTitle = $('<div>', {
+                    class: 'torrent-item__title'
+                });
+
+                let $torrentItemDetails = $('<div>', {
+                    class: 'torrent-item__details'
+                });
+
+                let $torrentItemProgress = $('<progress>', { max: 100 }).css('width', '100%');
+
+                $torrentItemDetails.append($torrentItemProgress);
+
+                $remoteTorrentDataContainer.append($torrentItemTitle);
+                $remoteTorrentDataContainer.append($torrentItemDetails);
+
+                e.item.find('.torrent-item__details').after($remoteTorrentDataContainer);
+
+                setTimeout(function () {
+                    rerenderTorrentHashItem(torrentHash);
+                }, 100);
+            } else if (e.type === 'onlong') {
+                let magnetURI = e.element.MagnetUri;
+                if (magnetURI) {
+                    let torrentHash = extractTorrentHash(magnetURI);
+                    if (!torrentHash) {
+                        return;
+                    }
+
+                    if (!currentMovieTorrentMap) {
+                        return;
+                    }
+
+                    let remoteTorrent = null;
+                    $.each(currentMovieTorrentMap, (key, remoteTorrentCandidate) => {
+                        if (remoteTorrentCandidate.hashString === torrentHash) {
+                            remoteTorrent = remoteTorrentCandidate;
+                        }
+                    });
+
+                    let currentMovieTorrentMapHashIndex = currentMovieTorrentMap.hashes.indexOf(torrentHash);
+                    if (currentMovieTorrentMapHashIndex > -1) {
+                        let currentMovieTorrentMapHash = currentMovieTorrentMap.hashes[currentMovieTorrentMapHashIndex];
+                        e.menu.push({
+                            title: "<div class=\"btnTDdownload wait\">\n                            <svg class=\"btnTDdownload\" viewBox=\"0 0 24 24\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\"><g id=\"SVGRepo_bgCarrier\" stroke-width=\"0\"></g><g id=\"SVGRepo_tracerCarrier\" stroke-linecap=\"round\" stroke-linejoin=\"round\"></g><g id=\"SVGRepo_iconCarrier\"> <path d=\"M8.5 7L8.5 14M8.5 14L11 11M8.5 14L6 11\" stroke=\"#ffffff\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\"></path> <path d=\"M15.5 7L15.5 14M15.5 14L18 11M15.5 14L13 11\" stroke=\"#ffffff\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\"></path> <path d=\"M18 17H12H6\" stroke=\"#ffffff\" stroke-width=\"1.5\" stroke-linecap=\"round\"></path> <path d=\"M2 12C2 7.28595 2 4.92893 3.46447 3.46447C4.92893 2 7.28595 2 12 2C16.714 2 19.0711 2 20.5355 3.46447C22 4.92893 22 7.28595 22 12C22 16.714 22 19.0711 20.5355 20.5355C19.0711 22 16.714 22 12 22C7.28595 22 4.92893 22 3.46447 20.5355C2 19.0711 2 16.714 2 12Z\" stroke=\"#ffffff\" stroke-width=\"1.5\"></path> </g></svg>\n                            Забыть</div>",
+                            onSelect: function () {
+                                Lampa.Listener.send('lme-movie-torrent-removed', currentMovieTorrentMapHash);
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
+        function rerenderTorrentHashItem(torrentHash) {
+            if (!remoteTorrentsData) {
+                return;
+            }
+
+            if (!currentMovieTorrentMap) {
+                return;
+            }
+
+            const remoteTorrent = remoteTorrentsData[torrentHash];
+
+            const $torrentHashItem = $('#torrent-hash-' + torrentHash);
+
+            let currentMovieTorrentMapHashIndex = currentMovieTorrentMap.hashes.indexOf(torrentHash);
+            if (currentMovieTorrentMapHashIndex > -1) {
+                $torrentHashItem.show();
+            } else {
+                $torrentHashItem.hide();
+            }
+
+            if (remoteTorrent) {
+                var progressPercent = Number((remoteTorrent.percentDone * 100).toFixed(2))
+
+                $torrentHashItem.find('progress').attr('value', progressPercent);
+                $torrentHashItem.find('.torrent-item__title').text(remoteTorrent.name + ' ' + progressPercent + '%');
+            }
+        }
+
+        Lampa.Listener.follow('lme-movie-torrent-added', remoteTorrent => {
+            if (!currentMovie) {
+                return;
+            }
+
+            let torrentMap = torrentsMap[currentMovie.id];
+            if (!torrentMap) {
+                torrentMap = {
+                    hashes: []
+                };
+
+                torrentsMap[currentMovie.id] = torrentMap;
+            }
+
+            torrentMap.hashes.push(remoteTorrent.torrentHash);
+            Lampa.Storage.set('lmetorrentTorrMap', torrentsMap);
+
+            currentMovieRemoteTorrentsListWasChanged();
+            rerenderTorrentHashItem(remoteTorrent.torrentHash);
+        });
+
+        Lampa.Listener.follow('lme-movie-torrent-removed', hashString => {
+            if (!currentMovie) {
+                return;
+            }
+
+            let torrentMap = torrentsMap[currentMovie.id];
+            if (!torrentMap) {
+                return;
+            }
+
+            delete remoteTorrentsData[hashString];
+
+            let index = torrentMap.hashes.indexOf(hashString);
+            if (index > -1) {
+                torrentMap.hashes.splice(index, 1);
+
+                if (torrentMap.hashes.length === 0) {
+                    delete torrentsMap[currentMovie.id];
+                }
+            }
+
+            Lampa.Storage.set('lmetorrentTorrMap', torrentsMap);
+            currentMovieRemoteTorrentsListWasChanged();
+            rerenderTorrentHashItem(hashString);
+        });
+
+        Lampa.Listener.follow('lme-torrents-data', data => {
+            if (!currentMovieTorrentMap) {
+                return;
+            }
+
+            currentMovieTorrentMap.hashes.forEach(torrentHash => {
+                const torrentData = data[torrentHash];
+
+                if (!torrentData) {
+                    return;
+                }
+
+                const $torrentItem = $('#torrent-item-' + torrentHash);
+
+                var progressPercent = Number((torrentData.percentDone * 100).toFixed(2));
+                $torrentItem.find('progress').attr('value', progressPercent);
+                $torrentItem.find('.torrent-item__title').text(torrentData.name + ' ' + progressPercent + '%');
+
+                rerenderTorrentHashItem(torrentHash);
+            });
+        });
+
         Send();
         // Start Transmission Auth */
         if (Lampa.Storage.get(manifest.component + 'Select') === 'transmission') Transmission.auth();
